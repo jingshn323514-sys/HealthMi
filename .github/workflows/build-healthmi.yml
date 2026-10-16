@@ -33,7 +33,7 @@ jobs:
           APP="$RUNNER_TEMP/healthmi-build/HealthMi.app"
           test -f "$APP/HealthMi"
           plutil -lint "$APP/Info.plist"
-          lipo -verify_arch arm64 "$APP/HealthMi"
+          lipo "$APP/HealthMi" -verify_arch arm64
           xcrun vtool -show-build "$APP/HealthMi" | tee "$RUNNER_TEMP/healthmi-platform.txt"
           grep -Eq 'platform[[:space:]]+IOS$' "$RUNNER_TEMP/healthmi-platform.txt"
           mkdir -p "$RUNNER_TEMP/healthmi-package/Payload" dist
