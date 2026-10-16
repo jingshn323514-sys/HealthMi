@@ -1,0 +1,59 @@
+name: Build HealthMi IPA
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/build-healthmi.yml
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record build environment
+        run: |
+          xcodebuild -version
+          git rev-parse HEAD
+      - name: Build unsigned iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project HealthMi.xcodeproj -target HealthMi -configuration Release -sdk iphoneos ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= CONFIGURATION_BUILD_DIR="$RUNNER_TEMP/healthmi-build" build 2>&1 | tee "$RUNNER_TEMP/healthmi-build.log"
+      - name: Package and verify IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/healthmi-build/HealthMi.app"
+          test -f "$APP/HealthMi"
+          plutil -lint "$APP/Info.plist"
+          lipo -verify_arch arm64 "$APP/HealthMi"
+          xcrun vtool -show-build "$APP/HealthMi" | tee "$RUNNER_TEMP/healthmi-platform.txt"
+          grep -Eq 'platform[[:space:]]+IOS$' "$RUNNER_TEMP/healthmi-platform.txt"
+          mkdir -p "$RUNNER_TEMP/healthmi-package/Payload" dist
+          cp -R "$APP" "$RUNNER_TEMP/healthmi-package/Payload/HealthMi.app"
+          (cd "$RUNNER_TEMP/healthmi-package" && zip -qry "$GITHUB_WORKSPACE/dist/HealthMi-unsigned.ipa" Payload)
+          unzip -t dist/HealthMi-unsigned.ipa
+          shasum -a 256 dist/HealthMi-unsigned.ipa > dist/SHA256SUMS.txt
+          git rev-parse HEAD > dist/SOURCE_COMMIT.txt
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: HealthMi-IPA
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HealthMi-build-log
+          path: ${{ runner.temp }}/healthmi-build.log
+          if-no-files-found: ignore
+          retention-days: 3
