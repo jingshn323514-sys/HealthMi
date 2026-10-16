@@ -1,0 +1,109 @@
+name: Repair HealthMi signing (Windows)
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/repair-healthmi-signing.yml
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Checkout pinned signing sources
+        shell: pwsh
+        run: |
+          git clone https://github.com/nab138/iloader work/iloader
+          git -C work/iloader checkout aa9aa3779e15498180e0205158b7ff91536877c6
+          git clone https://github.com/nab138/isideload work/isideload
+          git -C work/isideload checkout 8ca39b6203263e539408986e546c42e7c1cc3699
+      - name: Apply HealthMi-only repair
+        shell: python
+        run: |
+          from pathlib import Path
+          import json
+          
+          base = Path.cwd() / 'work'
+          loader = base / 'iloader'
+          library = base / 'isideload' / 'isideload'
+          
+          def replace_once(path, old, new):
+              source = path.read_text(encoding='utf-8')
+              assert source.count(old) == 1, f'Unexpected upstream source: {path}'
+              path.write_text(source.replace(old, new), encoding='utf-8')
+          
+          api = library / 'src/dev/app_ids.rs'
+          source = api.read_text(encoding='utf-8')
+          start = source.index('    async fn add_increased_memory_limit(')
+          end = source.index('\n}\n\nimpl AppIdsApi', start)
+          method = source[start:end].replace('add_increased_memory_limit', 'enable_healthkit')
+          method = method.replace('INCREASED_MEMORY_LIMIT', 'HEALTHKIT')
+          method = method.replace('increased memory', 'HealthKit')
+          api.write_text(source[:end] + '\n' + method + source[end:], encoding='utf-8')
+          
+          sideloader = library / 'src/sideload/sideloader.rs'
+          replace_once(sideloader, '        info!("App IDs configured");', '''        // Repair only the original HealthMi bundle; do not alter other apps.
+                  if main_bundle_id == "com.healthmi.HealthMi" {
+                      self.dev_session.enable_healthkit(&team, &main_app_id).await
+                          .context("Failed to enable HealthKit for HealthMi")?;
+                  }
+          
+                  info!("App IDs configured");''')
+          replace_once(sideloader,
+              '        let mut provisioning_profiles: Vec<(String, Profile, Dictionary)> = Vec::new();',
+              '''        if main_bundle_id == "com.healthmi.HealthMi" {
+                      let profile = ProvisioningProfile::parse(main_provisioning_profile.encoded_profile.as_ref())?;
+                      if profile.entitlements().get("com.apple.developer.healthkit")
+                          .and_then(plist::Value::as_boolean) != Some(true) {
+                          bail!("Apple returned a HealthMi profile without HealthKit; installation stopped. Retry to refresh the profile.");
+                      }
+                      info!("HealthMi provisioning profile grants HealthKit");
+                  }
+          
+                  let mut provisioning_profiles: Vec<(String, Profile, Dictionary)> = Vec::new();''')
+          
+          cargo = loader / 'src-tauri/Cargo.toml'
+          replace_once(cargo, 'isideload = { version = "0.4.6", features = ["fs-storage"] }',
+              'isideload = { path = "../../isideload/isideload", features = ["fs-storage"] }')
+          replace_once(loader / 'src/App.tsx', 'import { checkForUpdates } from "./update";', '')
+          replace_once(loader / 'src/App.tsx', '    checkForUpdates();', '    // This private HealthMi repair build does not check official updates.')
+          config = loader / 'src-tauri/tauri.conf.json'
+          data = json.loads(config.read_text(encoding='utf-8'))
+          data['app']['windows'][0]['title'] = 'HealthMi repair - modified iloader (github.com/nab138/iloader)'
+          config.write_text(json.dumps(data, indent=2), encoding='utf-8')
+          print('Patched HealthMi capability request and profile validation; retained original signing and authentication.')
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Install native build tools
+        run: choco install strawberryperl make --no-progress -y
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            work/iloader/src-tauri/target
+          key: healthmi-signer-windows-v1
+      - name: Build modified Windows helper
+        working-directory: work/iloader
+        run: |
+          bun i --frozen-lockfile
+          bun run tauri build --no-bundle --config src-tauri/ci.conf.json
+      - name: Package source changes and helper
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force deliverable
+          Copy-Item work/iloader/src-tauri/target/release/iloader.exe deliverable/HealthMi-Signing-Repair.exe
+          git -C work/isideload diff --output=../../deliverable/isideload-healthkit.patch
+          git -C work/iloader diff --output=../../deliverable/iloader-healthmi.patch
+          Copy-Item work/iloader/LICENSE* deliverable/
+          Copy-Item work/isideload/LICENSE deliverable/isideload-LICENSE
+          Set-Content deliverable/README.txt 'Private modified iloader for HealthMi HealthKit provisioning. Official upstream: https://github.com/nab138/iloader . Import the original HealthMi unsigned IPA. Apple authentication and signing run locally; no Apple credentials are used by this workflow.'
+          Get-FileHash deliverable/HealthMi-Signing-Repair.exe -Algorithm SHA256 | Format-List | Out-File deliverable/SHA256.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: HealthMi-Signing-Repair-Windows
+          path: deliverable/
+          if-no-files-found: error
