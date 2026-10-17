@@ -1,0 +1,131 @@
+name: HealthMi signing and login compatibility
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/login-compatibility.yml
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Checkout pinned signing sources
+        shell: pwsh
+        run: |
+          git clone https://github.com/nab138/iloader work/iloader
+          git -C work/iloader checkout aa9aa3779e15498180e0205158b7ff91536877c6
+          git clone https://github.com/nab138/isideload work/isideload
+          git -C work/isideload checkout 8ca39b6203263e539408986e546c42e7c1cc3699
+      - name: Apply HealthMi-only repair
+        shell: python
+        run: |
+          from pathlib import Path
+          import json
+          
+          base = Path.cwd() / 'work'
+          loader = base / 'iloader'
+          library = base / 'isideload' / 'isideload'
+          
+          def replace_once(path, old, new):
+              source = path.read_text(encoding='utf-8')
+              assert source.count(old) == 1, f'Unexpected upstream source: {path}'
+              path.write_text(source.replace(old, new), encoding='utf-8')
+          
+          api = library / 'src/dev/app_ids.rs'
+          source = api.read_text(encoding='utf-8')
+          start = source.index('    async fn add_increased_memory_limit(')
+          end = source.index('\n}\n\nimpl AppIdsApi', start)
+          method = source[start:end].replace('add_increased_memory_limit', 'enable_healthkit')
+          method = method.replace('INCREASED_MEMORY_LIMIT', 'HEALTHKIT')
+          method = method.replace('increased memory', 'HealthKit')
+          api.write_text(source[:end] + '\n' + method + source[end:], encoding='utf-8')
+          
+          sideloader = library / 'src/sideload/sideloader.rs'
+          replace_once(sideloader, '        info!("App IDs configured");', '''        // Repair only the original HealthMi bundle; do not alter other apps.
+                  if main_bundle_id == "com.healthmi.HealthMi" {
+                      self.dev_session.enable_healthkit(&team, &main_app_id).await
+                          .context("Failed to enable HealthKit for HealthMi")?;
+                  }
+          
+                  info!("App IDs configured");''')
+          replace_once(sideloader,
+              '        let mut provisioning_profiles: Vec<(String, Profile, Dictionary)> = Vec::new();',
+              '''        if main_bundle_id == "com.healthmi.HealthMi" {
+                      let profile = ProvisioningProfile::parse(main_provisioning_profile.encoded_profile.as_ref())?;
+                      if profile.entitlements().get("com.apple.developer.healthkit")
+                          .and_then(plist::Value::as_boolean) != Some(true) {
+                          bail!("Apple returned a HealthMi profile without HealthKit; installation stopped. Retry to refresh the profile.");
+                      }
+                      info!("HealthMi provisioning profile grants HealthKit");
+                  }
+          
+                  let mut provisioning_profiles: Vec<(String, Profile, Dictionary)> = Vec::new();''')
+          
+          cargo = loader / 'src-tauri/Cargo.toml'
+          replace_once(cargo, 'isideload = { version = "0.4.6", features = ["fs-storage"] }',
+              'isideload = { path = "../../isideload/isideload", features = ["fs-storage"] }')
+          replace_once(loader / 'src/App.tsx', 'import { checkForUpdates } from "./update";', '')
+          replace_once(loader / 'src/App.tsx', '    checkForUpdates();', '    // This private HealthMi repair build does not check official updates.')
+          config = loader / 'src-tauri/tauri.conf.json'
+          data = json.loads(config.read_text(encoding='utf-8'))
+          data['app']['windows'][0]['title'] = 'HealthMi repair - modified iloader (github.com/nab138/iloader)'
+          config.write_text(json.dumps(data, indent=2), encoding='utf-8')
+          print('Patched HealthMi capability request and profile validation; retained original signing and authentication.')
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Install native build tools
+        run: choco install strawberryperl make --no-progress -y
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            work/iloader/src-tauri/target
+          key: healthmi-signer-windows-v1
+      - name: Prepare login regression check
+        shell: python
+        run: |
+          import base64
+          from pathlib import Path
+          Path('work/patch_login_fallback.py').write_bytes(base64.b64decode('ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCmltcG9ydCBzeXMKCnBhdGggPSBQYXRoKCd3b3JrL2lzaWRlbG9hZC9pc2lkZWxvYWQvc3JjL2F1dGgvYXBwbGVfYWNjb3VudC5ycycpCnNvdXJjZSA9IHBhdGgucmVhZF90ZXh0KGVuY29kaW5nPSd1dGYtOCcpCmlmIHN5cy5hcmd2WzFdID09ICd0ZXN0cyc6CiAgICBzb3VyY2UgKz0gJycnCgojW2NmZyh0ZXN0KV0KbW9kIGhlYWx0aG1pX2xvZ2luX3JlZ3Jlc3Npb24gewogICAgdXNlIHN1cGVyOjoqOwoKICAgICNbdGVzdF0KICAgIGZuIGVtcHR5X3Ntc180MDNfb2ZmZXJzX2Fub3RoZXJfdmVyaWZpY2F0aW9uX21ldGhvZCgpIHsKICAgICAgICBhc3NlcnQhKEFwcGxlQWNjb3VudDo6Y2xhc3NpZnlfc21zX3NlbmRfcmVzcG9uc2UoNDAzLCAiIiwgMSkuaXNfb2soKSwKICAgICAgICAgICAgIkFuIGVtcHR5IFNNUyA0MDMgbXVzdCBvZmZlciB0cnVzdGVkLWRldmljZSB2ZXJpZmljYXRpb24gaW5zdGVhZCBvZiBhYm9ydGluZyBsb2dpbiIpOwogICAgfQoKICAgICNbdGVzdF0KICAgIGZuIHVuYXV0aG9yaXplZF9hbmRfc2VydmVyX2Vycm9yc19yZW1haW5fZXJyb3JzKCkgewogICAgICAgIGFzc2VydCEoQXBwbGVBY2NvdW50OjpjbGFzc2lmeV9zbXNfc2VuZF9yZXNwb25zZSg0MDEsICIiLCAxKS5pc19lcnIoKSk7CiAgICAgICAgYXNzZXJ0IShBcHBsZUFjY291bnQ6OmNsYXNzaWZ5X3Ntc19zZW5kX3Jlc3BvbnNlKDUwMCwgIiIsIDEpLmlzX2VycigpKTsKICAgIH0KCiAgICAjW3Rlc3RdCiAgICBmbiBleHBsaWNpdF9hcHBsZV9zZXJ2aWNlX2Vycm9yX2lzX3ByZXNlcnZlZCgpIHsKICAgICAgICBsZXQgYm9keSA9IHIjInsic2VydmljZUVycm9ycyI6W3siY29kZSI6Ii0yMjk4MSIsInRpdGxlIjoiTGltaXRlZCIsIm1lc3NhZ2UiOiJUcnkgbGF0ZXIifV19IiM7CiAgICAgICAgbWF0Y2ggQXBwbGVBY2NvdW50OjpjbGFzc2lmeV9zbXNfc2VuZF9yZXNwb25zZSg0MDMsIGJvZHksIDEpLnVud3JhcCgpIHsKICAgICAgICAgICAgU21zU2VuZE91dGNvbWU6OlNlcnZpY2VFcnJvcihlcnJvcikgPT4gYXNzZXJ0X2VxIShlcnJvci5jb2RlLCAiLTIyOTgxIiksCiAgICAgICAgICAgIG90aGVyID0+IHBhbmljISgiTXVzdCBwcmVzZXJ2ZSBBcHBsZSdzIHNlcnZpY2UgZXJyb3I6IHs6P30iLCBvdGhlciksCiAgICAgICAgfQogICAgfQp9CicnJwplbGlmIHN5cy5hcmd2WzFdID09ICdmaXgnOgogICAgZGVmIHJlcGxhY2Uob2xkLCBuZXcpOgogICAgICAgIGdsb2JhbCBzb3VyY2UKICAgICAgICBhc3NlcnQgc291cmNlLmNvdW50KG9sZCkgPT0gMSwgb2xkCiAgICAgICAgc291cmNlID0gc291cmNlLnJlcGxhY2Uob2xkLCBuZXcpCiAgICByZXBsYWNlKCcnJ2VudW0gU21zU2VuZE91dGNvbWUgewogICAgU2VudCwnJycsICcnJ2VudW0gU21zU2VuZE91dGNvbWUgewogICAgUmVxdWVzdFRydXN0ZWREZXZpY2UsCiAgICBTZW50LCcnJykKICAgIHJlcGxhY2UoJycnICAgICAgICAgICAgU21zU2VuZE91dGNvbWU6OlNlbnQgPT4geycnJywgJycnICAgICAgICAgICAgU21zU2VuZE91dGNvbWU6OlJlcXVlc3RUcnVzdGVkRGV2aWNlID0+IHsKICAgICAgICAgICAgICAgIC8vIFRoaXMgZG9lcyBub3QgYXV0aGVudGljYXRlIHRoZSBhY2NvdW50LiBBcHBsZSBtdXN0IHN0aWxsIHNlbmQKICAgICAgICAgICAgICAgIC8vIGFuZCB2YWxpZGF0ZSBhIHRydXN0ZWQtZGV2aWNlIGNvZGUgdGhyb3VnaCB0aGUgbm9ybWFsIGZsb3cuCiAgICAgICAgICAgICAgICBpbmZvISgiU01TIHJldHVybmVkIGVtcHR5IEhUVFAgNDAzOyByZXF1ZXN0aW5nIHRydXN0ZWQtZGV2aWNlIHZlcmlmaWNhdGlvbiBpbnN0ZWFkIik7CiAgICAgICAgICAgICAgICByZXR1cm4gT2soTG9naW5TdGF0ZTo6TmVlZHNEZXZpY2UyRkEpOwogICAgICAgICAgICB9CiAgICAgICAgICAgIFNtc1NlbmRPdXRjb21lOjpTZW50ID0+IHsnJycpCiAgICByZXBsYWNlKCcnJyAgICAgICAgaWYgbGV0IFNvbWUoZXJyb3IpID0gU2VsZjo6cGFyc2Vfc21zX3NlcnZpY2VfZXJyb3IodGV4dCkgewogICAgICAgICAgICByZXR1cm4gT2soU21zU2VuZE91dGNvbWU6OlNlcnZpY2VFcnJvcihlcnJvcikpOwogICAgICAgIH0nJycsICcnJyAgICAgICAgaWYgbGV0IFNvbWUoZXJyb3IpID0gU2VsZjo6cGFyc2Vfc21zX3NlcnZpY2VfZXJyb3IodGV4dCkgewogICAgICAgICAgICByZXR1cm4gT2soU21zU2VuZE91dGNvbWU6OlNlcnZpY2VFcnJvcihlcnJvcikpOwogICAgICAgIH0KCiAgICAgICAgaWYgc3RhdHVzID09IDQwMyAmJiB0ZXh0LnRyaW0oKS5pc19lbXB0eSgpIHsKICAgICAgICAgICAgcmV0dXJuIE9rKFNtc1NlbmRPdXRjb21lOjpSZXF1ZXN0VHJ1c3RlZERldmljZSk7CiAgICAgICAgfScnJykKICAgIHJlcGxhY2UoJycnICAgICAgICAgICAgICAgICAgICAgICAgLmNvbnRleHQoIkZhaWxlZCB0byBjb21wbGV0ZSB0cnVzdGVkIGRldmljZSAyRkEiKT87JycnLCAnJycgICAgICAgICAgICAgICAgICAgICAgICAuY29udGV4dCgiQXBwbGUgYWxzbyByZWZ1c2VkIHRydXN0ZWQtZGV2aWNlIHZlcmlmaWNhdGlvbiBhZnRlciBzZWxlY3RpbmcgdGhhdCBtZXRob2QuIE5vIHZlcmlmaWNhdGlvbiB3YXMgYnlwYXNzZWQ7IGFjY291bnQgb3IgQW5pc2V0dGUgY29tcGF0aWJpbGl0eSBuZWVkcyBmdXJ0aGVyIGRpYWdub3Npcy4iKT87JycnKQogICAgc291cmNlICs9ICcnJwojW2NmZyh0ZXN0KV0KbW9kIGhlYWx0aG1pX2xvZ2luX3JvdXRpbmcgewogICAgdXNlIHN1cGVyOjoqOwogICAgI1t0ZXN0XQogICAgZm4gc21zX3JlZnVzYWxfcmVxdWVzdHNfZGV2aWNlX2NvZGVfbm90X3Ntc19zdWNjZXNzKCkgewogICAgICAgIGFzc2VydCEobWF0Y2hlcyEoQXBwbGVBY2NvdW50OjpjbGFzc2lmeV9zbXNfc2VuZF9yZXNwb25zZSg0MDMsICIiLCAxKS51bndyYXAoKSwKICAgICAgICAgICAgU21zU2VuZE91dGNvbWU6OlJlcXVlc3RUcnVzdGVkRGV2aWNlKSk7CiAgICB9Cn0KJycnCmVsc2U6CiAgICByYWlzZSBWYWx1ZUVycm9yKCdFeHBlY3RlZCB0ZXN0cyBvciBmaXgnKQpwYXRoLndyaXRlX3RleHQoc291cmNlLCBlbmNvZGluZz0ndXRmLTgnKQpwcmludCgnUHJlcGFyZWQgbG9naW4gZmFsbGJhY2s6Jywgc3lzLmFyZ3ZbMV0pCg=='))
+      - name: Verify login regression fails before repair
+        shell: pwsh
+        run: |
+          python work/patch_login_fallback.py tests
+          cargo test --release --manifest-path work/iloader/src-tauri/Cargo.toml -p isideload --lib healthmi_login_regression > baseline.log 2>&1
+          $taskTestExit = $LASTEXITCODE
+          Get-Content baseline.log -Tail 45
+          if ($taskTestExit -eq 0) { throw 'Expected regression failure was not reproduced' }
+          if (-not (Select-String -Path baseline.log -Pattern 'empty_sms_403_offers_another_verification_method.*FAILED' -Quiet)) { throw 'Baseline failed for an unexpected reason' }
+          exit 0
+      - name: Repair login and pass verification regressions
+        shell: pwsh
+        run: |
+          python work/patch_login_fallback.py fix
+          cargo test --release --manifest-path work/iloader/src-tauri/Cargo.toml -p isideload --lib healthmi_login_
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build modified Windows helper
+        working-directory: work/iloader
+        run: |
+          bun i --frozen-lockfile
+          bun run tauri build --no-bundle --config src-tauri/ci.conf.json
+      - name: Package source changes and helper
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force deliverable
+          Copy-Item work/iloader/src-tauri/target/release/iloader.exe deliverable/HealthMi-Login-Repair.exe
+          git -C work/isideload diff --output=../../deliverable/isideload-healthkit.patch
+          git -C work/iloader diff --output=../../deliverable/iloader-healthmi.patch
+          Copy-Item work/iloader/LICENSE* deliverable/
+          Copy-Item work/isideload/LICENSE deliverable/isideload-LICENSE
+          Set-Content deliverable/README.txt 'Private modified iloader for HealthMi HealthKit provisioning and SMS 403 trusted-device verification fallback. Official upstream: https://github.com/nab138/iloader . Import the original HealthMi unsigned IPA. Apple authentication and signing run locally; no Apple credentials are used by this workflow.'
+          Get-FileHash deliverable/HealthMi-Login-Repair.exe -Algorithm SHA256 | Format-List | Out-File deliverable/SHA256.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: HealthMi-Login-Repair-Windows
+          path: deliverable/
+          if-no-files-found: error
